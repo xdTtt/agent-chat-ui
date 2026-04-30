@@ -208,6 +208,18 @@ export function AssistantMessage({
                 isAiMessage={true}
                 handleRegenerate={() => handleRegenerate(parentCheckpoint)}
               />
+              {message &&
+                "usage_metadata" in message &&
+                (message as { usage_metadata?: { total_tokens?: number } })
+                  .usage_metadata && (
+                  <span className="text-xs text-muted-foreground">
+                    {
+                      (message as { usage_metadata: { total_tokens: number } })
+                        .usage_metadata.total_tokens
+                    }{" "}
+                    tokens
+                  </span>
+                )}
             </div>
           </>
         )}
