@@ -15,6 +15,67 @@ import { useQueryState, parseAsBoolean } from "nuqs";
 import { GenericInterruptView } from "./generic-interrupt";
 import { useArtifact } from "../artifact";
 
+function getTokenMeta(
+  message: Message,
+):
+  | { input_tokens: number; output_tokens: number; total_tokens: number }
+  | null {
+  if ("usage_metadata" in message && message.usage_metadata) {
+    const um = message.usage_metadata;
+    if (um.input_tokens != null && um.output_tokens != null) {
+      return {
+        input_tokens: um.input_tokens,
+        output_tokens: um.output_tokens,
+        total_tokens: um.total_tokens ?? um.input_tokens + um.output_tokens,
+      };
+    }
+  }
+  // Fallback: response_metadata.token_usage (some providers)
+  if ("response_metadata" in message && message.response_metadata) {
+    const rm = message.response_metadata as Record<string, unknown>;
+    const tu = (rm.token_usage ?? rm.usage) as
+      | Record<string, number>
+      | undefined;
+    if (tu) {
+      const input = tu.prompt_tokens ?? tu.input_tokens ?? 0;
+      const output = tu.completion_tokens ?? tu.output_tokens ?? 0;
+      if (input || output) {
+        return {
+          input_tokens: input,
+          output_tokens: output,
+          total_tokens: tu.total_tokens ?? input + output,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function TokenUsage({
+  meta,
+  messages,
+}: {
+  meta: NonNullable<ReturnType<typeof getTokenMeta>>;
+  messages: Message[];
+}) {
+  let totalInput = 0;
+  let totalOutput = 0;
+  for (const m of messages) {
+    const um = getTokenMeta(m);
+    if (um) {
+      totalInput += um.input_tokens;
+      totalOutput += um.output_tokens;
+    }
+  }
+  const format = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n);
+  return (
+    <span className="text-xs text-muted-foreground">
+      {format(meta.input_tokens)}↓ {format(meta.output_tokens)}↑{" "}
+      (Σ {format(totalInput + totalOutput)})
+    </span>
+  );
+}
+
 function CustomComponent({
   message,
   thread,
@@ -208,19 +269,13 @@ export function AssistantMessage({
                 isAiMessage={true}
                 handleRegenerate={() => handleRegenerate(parentCheckpoint)}
               />
-              {message &&
-                "usage_metadata" in message &&
-                (message as { usage_metadata?: { total_tokens?: number } })
-                  .usage_metadata && (
-                  <span className="text-xs text-muted-foreground">
-                    {
-                      (message as { usage_metadata: { total_tokens: number } })
-                        .usage_metadata.total_tokens
-                    }{" "}
-                    tokens
-                  </span>
-                )}
             </div>
+            {message && getTokenMeta(message) && (
+              <TokenUsage
+                meta={getTokenMeta(message)!}
+                messages={thread.messages}
+              />
+            )}
           </>
         )}
       </div>
