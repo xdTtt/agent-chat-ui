@@ -1,16 +1,17 @@
-import { validate } from "uuid";
-import { getApiKey } from "@/lib/api-key";
-import { Thread } from "@langchain/langgraph-sdk";
-import { useQueryState } from "nuqs";
-import {
+import React, {
   createContext,
   useContext,
   ReactNode,
   useCallback,
+  useMemo,
   useState,
   Dispatch,
   SetStateAction,
 } from "react";
+import { validate } from "uuid";
+import { getApiKey } from "@/lib/api-key";
+import { Thread } from "@langchain/langgraph-sdk";
+import { useQueryState } from "nuqs";
 import { createClient } from "./client";
 
 interface ThreadContextType {
@@ -39,9 +40,15 @@ export function ThreadProvider({ children }: { children: ReactNode }) {
     process.env.NEXT_PUBLIC_ASSISTANT_ID;
   const envAuthScheme: string | undefined = process.env.NEXT_PUBLIC_AUTH_SCHEME;
 
-  const [apiUrl] = useQueryState("apiUrl", {
+  const [rawApiUrl] = useQueryState("apiUrl", {
     defaultValue: envApiUrl || "",
   });
+  const apiUrl = useMemo(() => {
+    if (rawApiUrl.startsWith("/") && typeof window !== "undefined") {
+      return window.location.origin + rawApiUrl;
+    }
+    return rawApiUrl;
+  }, [rawApiUrl]);
   const [assistantId] = useQueryState("assistantId");
   const [authScheme] = useQueryState("authScheme", {
     defaultValue: envAuthScheme || "",
