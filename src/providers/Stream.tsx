@@ -4,6 +4,7 @@ import React, {
   ReactNode,
   useState,
   useEffect,
+  useMemo,
 } from "react";
 import { useStream } from "@langchain/langgraph-sdk/react";
 import { type Message } from "@langchain/langgraph-sdk";
@@ -177,7 +178,13 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   };
 
   // Determine final values to use, prioritizing URL params then env vars
-  const finalApiUrl = apiUrl || envApiUrl;
+  const finalApiUrl = useMemo(() => {
+    let url = apiUrl || envApiUrl || "";
+    if (url.startsWith("/") && typeof window !== "undefined") {
+      url = window.location.origin + url;
+    }
+    return url;
+  }, [apiUrl, envApiUrl]);
   const finalAssistantId = assistantId || envAssistantId;
   const finalAuthScheme = authScheme || envAuthScheme || "";
 
