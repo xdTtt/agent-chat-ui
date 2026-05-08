@@ -15,7 +15,7 @@ import { useQueryState, parseAsBoolean } from "nuqs";
 import { GenericInterruptView } from "./generic-interrupt";
 import { useArtifact } from "../artifact";
 
-function getTokenMeta(
+export function getTokenMeta(
   message: Message,
 ):
   | { input_tokens: number; output_tokens: number; total_tokens: number }
@@ -51,28 +51,33 @@ function getTokenMeta(
   return null;
 }
 
-function TokenUsage({
-  meta,
-  messages,
+function TurnSummary({
+  summary,
+  firstTokenLatency,
 }: {
-  meta: NonNullable<ReturnType<typeof getTokenMeta>>;
-  messages: Message[];
+  summary: {
+    totalInput: number;
+    totalOutput: number;
+    llmCalls: number;
+  };
+  firstTokenLatency: number | null;
 }) {
-  let totalInput = 0;
-  let totalOutput = 0;
-  for (const m of messages) {
-    const um = getTokenMeta(m);
-    if (um) {
-      totalInput += um.input_tokens;
-      totalOutput += um.output_tokens;
-    }
-  }
   const format = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n);
+  const total = summary.totalInput + summary.totalOutput;
+  const fmtLatency = (ms: number) =>
+    ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
   return (
-    <span className="text-xs text-muted-foreground">
-      {format(meta.input_tokens)}↓ {format(meta.output_tokens)}↑{" "}
-      (Σ {format(totalInput + totalOutput)})
-    </span>
+    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 font-mono">
+        ↑{format(summary.totalInput)} ↓{format(summary.totalOutput)}{" "}
+        Σ{format(total)}
+      </span>
+      {firstTokenLatency != null && (
+        <span className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 font-mono">
+          TTFT {fmtLatency(firstTokenLatency)}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -163,10 +168,18 @@ export function AssistantMessage({
   message,
   isLoading,
   handleRegenerate,
+  firstTokenLatency,
+  turnSummary,
 }: {
   message: Message | undefined;
   isLoading: boolean;
   handleRegenerate: (parentCheckpoint: Checkpoint | null | undefined) => void;
+  firstTokenLatency: number | null;
+  turnSummary: {
+    totalInput: number;
+    totalOutput: number;
+    llmCalls: number;
+  } | null;
 }) {
   const content = message?.content ?? [];
   const contentString = getContentString(content);
@@ -270,10 +283,10 @@ export function AssistantMessage({
                 handleRegenerate={() => handleRegenerate(parentCheckpoint)}
               />
             </div>
-            {message && getTokenMeta(message) && (
-              <TokenUsage
-                meta={getTokenMeta(message)!}
-                messages={thread.messages}
+            {message && turnSummary && (
+              <TurnSummary
+                summary={turnSummary}
+                firstTokenLatency={firstTokenLatency}
               />
             )}
           </>

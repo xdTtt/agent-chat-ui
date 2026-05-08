@@ -1,12 +1,16 @@
 import { v4 as uuidv4 } from "uuid";
-import { ReactNode, useEffect, useRef } from "react";
+import { ReactNode, useEffect, useMemo, useRef } from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { useState, FormEvent } from "react";
 import { Button } from "../ui/button";
 import { Checkpoint, Message } from "@langchain/langgraph-sdk";
-import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
+import {
+  AssistantMessage,
+  AssistantMessageLoading,
+  getTokenMeta,
+} from "./messages/ai";
 import { HumanMessage } from "./messages/human";
 import {
   DO_NOT_RENDER_ID_PREFIX,
@@ -136,6 +140,9 @@ export function Thread() {
     handlePaste,
   } = useFileUpload();
   const [firstTokenReceived, setFirstTokenReceived] = useState(false);
+  const firstTokenStartRef = useRef(0);
+  const ttftMapRef = useRef<Map<string, number>>(new Map());
+  const [ttftVersion, setTtftVersion] = useState(0);
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
 
   const stream = useStreamContext();
@@ -180,7 +187,8 @@ export function Thread() {
     }
   }, [stream.error]);
 
-  // TODO: this should be part of the useStream hook
+  // Track TTFT per turn: store the latency when first AI token arrives,
+  // bind it to the last AI message of the current turn, persist across turns.
   const prevMessageLength = useRef(0);
   useEffect(() => {
     if (
@@ -188,16 +196,87 @@ export function Thread() {
       messages?.length &&
       messages[messages.length - 1].type === "ai"
     ) {
+      if (!firstTokenReceived && firstTokenStartRef.current > 0) {
+        const latency = Date.now() - firstTokenStartRef.current;
+        firstTokenStartRef.current = 0;
+        // Find the last AI message in the current turn (walking backward)
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].type === "ai" && messages[i].id) {
+            const aiId = messages[i].id!;
+            if (!ttftMapRef.current.has(aiId)) {
+              ttftMapRef.current.set(aiId, latency);
+              setTtftVersion((v) => v + 1);
+            }
+            break;
+          }
+        }
+      }
       setFirstTokenReceived(true);
     }
 
     prevMessageLength.current = messages.length;
   }, [messages]);
 
+  // Compute per-turn token summaries.
+  // Each "turn" = messages after a HumanMessage until the next HumanMessage (or end).
+  // The summary is attached to the last AI message of the turn.
+  const turnSummaryMap = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        totalInput: number;
+        totalOutput: number;
+        llmCalls: number;
+        ttft: number | null;
+      }
+    >();
+    let turnAiMsgs: Message[] = [];
+    let turnIndex = 0;
+
+    const flush = () => {
+      if (turnAiMsgs.length === 0) return;
+      const lastAi = turnAiMsgs[turnAiMsgs.length - 1];
+      let totalInput = 0;
+      let totalOutput = 0;
+      let llmCalls = 0;
+      for (const ai of turnAiMsgs) {
+        const um = getTokenMeta(ai);
+        if (um) {
+          totalInput += um.input_tokens;
+          totalOutput += um.output_tokens;
+          llmCalls++;
+        }
+      }
+      if (lastAi.id && (totalInput || totalOutput)) {
+        map.set(lastAi.id, {
+          totalInput,
+          totalOutput,
+          llmCalls,
+          ttft: ttftMapRef.current.get(lastAi.id) ?? null,
+        });
+      }
+      turnAiMsgs = [];
+      turnIndex++;
+    };
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.type === "human") {
+        flush();
+      } else if (m.type === "ai") {
+        turnAiMsgs.push(m);
+      }
+    }
+    flush();
+
+    return map;
+  }, [messages, ttftVersion]);
+
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
       return;
+    firstTokenStartRef.current = Date.now();
     setFirstTokenReceived(false);
 
     const newHumanMessage: Message = {
@@ -220,6 +299,7 @@ export function Thread() {
         streamMode: ["values"],
         streamSubgraphs: true,
         streamResumable: true,
+        durability: "exit",
         optimisticValues: (prev) => ({
           ...prev,
           context,
@@ -247,6 +327,7 @@ export function Thread() {
       streamMode: ["values"],
       streamSubgraphs: true,
       streamResumable: true,
+      durability: "exit",
     });
   };
 
@@ -414,6 +495,10 @@ export function Thread() {
                           message={message}
                           isLoading={isLoading}
                           handleRegenerate={handleRegenerate}
+                          firstTokenLatency={turnSummaryMap.get(message.id ?? "")?.ttft ?? null}
+                          turnSummary={
+                            turnSummaryMap.get(message.id ?? "") ?? null
+                          }
                         />
                       ),
                     )}
@@ -425,6 +510,8 @@ export function Thread() {
                       message={undefined}
                       isLoading={isLoading}
                       handleRegenerate={handleRegenerate}
+                      firstTokenLatency={null}
+                      turnSummary={null}
                     />
                   )}
                   {isLoading && !firstTokenReceived && (
