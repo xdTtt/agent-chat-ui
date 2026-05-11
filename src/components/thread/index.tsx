@@ -1,12 +1,12 @@
 import { v4 as uuidv4 } from "uuid";
-import { ReactNode, useEffect, useRef } from "react";
+import { ReactNode, useEffect, useMemo, useRef } from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { useState, FormEvent } from "react";
 import { Button } from "../ui/button";
-import { Checkpoint, Message } from "@langchain/langgraph-sdk";
-import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
+import { Message } from "@langchain/langgraph-sdk";
+import { AssistantMessage, AssistantMessageLoading, getTokenMeta } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
 import {
   DO_NOT_RENDER_ID_PREFIX,
@@ -93,7 +93,7 @@ function OpenGitHubRepo() {
       <Tooltip>
         <TooltipTrigger asChild>
           <a
-            href="https://github.com/langchain-ai/agent-chat-ui"
+            href="https://github.com/xdTtt/NovelIndex"
             target="_blank"
             className="flex items-center justify-center"
           >
@@ -141,6 +141,49 @@ export function Thread() {
   const stream = useStreamContext();
   const messages = stream.messages;
   const isLoading = stream.isLoading;
+
+  // Per-turn token summaries. Each turn = messages between HumanMessages.
+  const turnSummaryMap = useMemo(() => {
+    const map = new Map<string, {
+      totalInput: number;
+      totalOutput: number;
+      llmCalls: number;
+      ttft_ms: number | null;
+    }>();
+    let turnAiMsgs: Message[] = [];
+
+    const flush = () => {
+      if (turnAiMsgs.length === 0) return;
+      const lastAi = turnAiMsgs[turnAiMsgs.length - 1];
+      let totalInput = 0;
+      let totalOutput = 0;
+      let llmCalls = 0;
+      let ttft: number | null = null;
+      for (const ai of turnAiMsgs) {
+        const um = getTokenMeta(ai);
+        if (um) {
+          totalInput += um.input_tokens;
+          totalOutput += um.output_tokens;
+          llmCalls++;
+          if (um.ttft_ms != null && ttft === null) ttft = um.ttft_ms;
+        }
+      }
+      if (lastAi.id && (totalInput || totalOutput)) {
+        map.set(lastAi.id, { totalInput, totalOutput, llmCalls, ttft_ms: ttft });
+      }
+      turnAiMsgs = [];
+    };
+
+    for (const m of messages) {
+      if (m.type === "human") {
+        flush();
+      } else if (m.type === "ai") {
+        turnAiMsgs.push(m);
+      }
+    }
+    flush();
+    return map;
+  }, [messages]);
 
   const lastError = useRef<string | undefined>(undefined);
 
@@ -216,20 +259,6 @@ export function Thread() {
 
     stream.submit(
       { messages: [...toolMessages, newHumanMessage], context },
-      {
-        streamMode: ["values"],
-        streamSubgraphs: true,
-        streamResumable: true,
-        optimisticValues: (prev) => ({
-          ...prev,
-          context,
-          messages: [
-            ...(prev.messages ?? []),
-            ...toolMessages,
-            newHumanMessage,
-          ],
-        }),
-      },
     );
 
     setInput("");
@@ -237,17 +266,9 @@ export function Thread() {
   };
 
   const handleRegenerate = (
-    parentCheckpoint: Checkpoint | null | undefined,
+    _parentCheckpoint: unknown,
   ) => {
-    // Do this so the loading state is correct
-    prevMessageLength.current = prevMessageLength.current - 1;
-    setFirstTokenReceived(false);
-    stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
-      streamMode: ["values"],
-      streamSubgraphs: true,
-      streamResumable: true,
-    });
+    // Regeneration not supported with custom API yet
   };
 
   const chatStarted = !!threadId || !!messages.length;
@@ -414,6 +435,7 @@ export function Thread() {
                           message={message}
                           isLoading={isLoading}
                           handleRegenerate={handleRegenerate}
+                          turnSummary={turnSummaryMap.get(message.id ?? "") ?? null}
                         />
                       ),
                     )}
@@ -425,6 +447,7 @@ export function Thread() {
                       message={undefined}
                       isLoading={isLoading}
                       handleRegenerate={handleRegenerate}
+                      turnSummary={null}
                     />
                   )}
                   {isLoading && !firstTokenReceived && (

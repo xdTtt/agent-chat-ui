@@ -5,120 +5,74 @@ import React, {
   useState,
   useEffect,
   useMemo,
+  useCallback,
+  useRef,
 } from "react";
-import { useStream } from "@langchain/langgraph-sdk/react";
-import { type Message } from "@langchain/langgraph-sdk";
-import {
-  uiMessageReducer,
-  isUIMessage,
-  isRemoveUIMessage,
-  type UIMessage,
-  type RemoveUIMessage,
-} from "@langchain/langgraph-sdk/react-ui";
 import { useQueryState } from "nuqs";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { LangGraphLogoSVG } from "@/components/icons/langgraph";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { ArrowRight } from "lucide-react";
-import { PasswordInput } from "@/components/ui/password-input";
-import { getApiKey } from "@/lib/api-key";
 import { useThreads } from "./Thread";
 import { toast } from "sonner";
+import type { Message } from "@langchain/langgraph-sdk";
+import { streamChat, fetchJSON, type SessionMessage } from "./api-client";
 
-export type StateType = { messages: Message[]; ui?: UIMessage[] };
+export type StateType = { messages: Message[] };
 
-const useTypedStream = useStream<
-  StateType,
-  {
-    UpdateType: {
-      messages?: Message[] | Message | string;
-      ui?: (UIMessage | RemoveUIMessage)[] | UIMessage | RemoveUIMessage;
-      context?: Record<string, unknown>;
-    };
-    CustomEventType: UIMessage | RemoveUIMessage;
-  }
->;
-
-type StreamContextType = ReturnType<typeof useTypedStream>;
-const StreamContext = createContext<StreamContextType | undefined>(undefined);
-
-async function sleep(ms = 4000) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export interface MessageMetadata {
+  branch?: string;
+  branchOptions?: string[];
+  firstSeenState?: { parent_checkpoint?: unknown } | null;
 }
 
-async function checkGraphStatus(
-  apiUrl: string,
-  apiKey: string | null,
-  authScheme?: string,
-): Promise<boolean> {
+interface StreamContextType {
+  messages: Message[];
+  isLoading: boolean;
+  error: unknown;
+  threadId: string | null;
+  values: Record<string, unknown>;
+  submit: (
+    input: { messages?: Message[] } | Record<string, unknown>,
+    options?: Record<string, unknown>,
+  ) => void;
+  stop: () => void;
+  interrupt: unknown;
+  getMessagesMetadata: (message: Message) => MessageMetadata | null;
+  setBranch: (branch: string) => void;
+}
+
+const StreamContext = createContext<StreamContextType | undefined>(undefined);
+
+const DEFAULT_API_URL = "http://localhost:8000/api";
+
+async function checkServerStatus(apiUrl: string): Promise<boolean> {
   try {
-    const headers = new Headers();
-    if (apiKey) headers.set("X-Api-Key", apiKey);
-    if (authScheme) headers.set("X-Auth-Scheme", authScheme);
-
-    const res = await fetch(`${apiUrl}/info`, {
-      headers,
-    });
-
+    const res = await fetch(`${apiUrl}/health`);
     return res.ok;
-  } catch (e) {
-    console.error(e);
+  } catch {
     return false;
   }
 }
 
-const StreamSession = ({
-  children,
-  apiKey,
-  apiUrl,
-  assistantId,
-  authScheme,
-}: {
-  children: ReactNode;
-  apiKey: string | null;
-  apiUrl: string;
-  assistantId: string;
-  authScheme?: string;
-}) => {
+function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: string }) {
   const [threadId, setThreadId] = useQueryState("threadId");
   const { getThreads, setThreads } = useThreads();
-  const streamValue = useTypedStream({
-    apiUrl,
-    apiKey: apiKey ?? undefined,
-    assistantId,
-    ...(authScheme && {
-      defaultHeaders: {
-        "X-Auth-Scheme": authScheme,
-      },
-    }),
-    threadId: threadId ?? null,
-    fetchStateHistory: true,
-    onCustomEvent: (event, options) => {
-      if (isUIMessage(event) || isRemoveUIMessage(event)) {
-        options.mutate((prev) => {
-          const ui = uiMessageReducer(prev.ui ?? [], event);
-          return { ...prev, ui };
-        });
-      }
-    },
-    onThreadId: (id) => {
-      setThreadId(id);
-      // Refetch threads list when thread ID changes.
-      // Wait for some seconds before fetching so we're able to get the new thread that was created.
-      sleep().then(() => getThreads().then(setThreads).catch(console.error));
-    },
-  });
+
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  const abortRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    checkGraphStatus(apiUrl, apiKey, authScheme).then((ok) => {
+    checkServerStatus(apiUrl).then((ok) => {
       if (!ok) {
-        toast.error("Failed to connect to LangGraph server", {
+        toast.error("Failed to connect to chat server", {
           description: () => (
             <p>
-              Please ensure your graph is running at <code>{apiUrl}</code> and
-              your API key is correctly set (if connecting to a deployed graph).
+              Please ensure the server is running at <code>{apiUrl}</code>
             </p>
           ),
           duration: 10000,
@@ -127,69 +81,286 @@ const StreamSession = ({
         });
       }
     });
-  }, [apiKey, apiUrl, authScheme]);
+  }, [apiUrl]);
+
+  // Load messages when switching to an existing session
+  useEffect(() => {
+    if (!threadId) {
+      setMessages([]);
+      return;
+    }
+    fetchJSON<SessionMessage[]>(`/sessions/${threadId}/messages`)
+      .then((data) => {
+        const loaded = data
+          .filter((m) => m.type === "human" || m.type === "ai" || m.type === "tool")
+          .map((m): Message => {
+            if (m.type === "human") {
+              return { id: crypto.randomUUID(), type: "human", content: m.content } as Message;
+            }
+            if (m.type === "tool") {
+              return {
+                id: crypto.randomUUID(),
+                type: "tool",
+                content: m.content,
+                name: (m as any).name || "tool",
+                tool_call_id: "",
+              } as Message;
+            }
+            return {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content: m.content,
+              ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+              ...(m.usage_metadata ? { usage_metadata: m.usage_metadata } : {}),
+            } as Message;
+          });
+        setMessages(loaded);
+      })
+      .catch(() => setMessages([]));
+  }, [threadId]);
+
+  const submit = useCallback(
+    (input: { messages?: Message[] } | Record<string, unknown>, _options?: Record<string, unknown>) => {
+      const msgs = (input as { messages?: Message[] }).messages;
+      if (!msgs || !msgs.length) return;
+      const lastMessage = msgs[msgs.length - 1];
+      const text =
+        typeof lastMessage.content === "string"
+          ? lastMessage.content
+          : Array.isArray(lastMessage.content)
+            ? lastMessage.content
+                .filter(
+                  (c): c is { type: "text"; text: string } =>
+                    "type" in c && c.type === "text",
+                )
+                .map((c) => c.text)
+                .join("")
+            : "";
+
+      if (!text.trim()) return;
+
+      const humanMsg: Message = {
+        id: lastMessage.id || crypto.randomUUID(),
+        type: "human",
+        content: lastMessage.content,
+      };
+      setMessages((prev) => [...prev, humanMsg]);
+      setIsLoading(true);
+      setError(null);
+
+      const { stream, cancel } = streamChat({
+        message: text,
+        session_id: threadId || undefined,
+      });
+      abortRef.current = cancel;
+
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const aiMessageId = crypto.randomUUID();
+      let aiContent = "";
+      let pendingTokens = "";
+      let rafId: number | null = null;
+      let lastUsageMeta: Record<string, unknown> | null = null;
+
+      function updateAiMessage(content: string) {
+        setMessages((prev) => {
+          const extra = lastUsageMeta ? { usage_metadata: lastUsageMeta as any } : {};
+          const idx = prev.findIndex((m) => m.id === aiMessageId);
+          if (idx !== -1) {
+            return prev.map((m, i) => i === idx ? { ...m, content, ...extra } : m);
+          }
+          return [
+            ...prev,
+            { id: aiMessageId, type: "ai" as const, content, ...extra },
+          ];
+        });
+      }
+
+      function flushTokens() {
+        if (pendingTokens) {
+          aiContent += pendingTokens;
+          pendingTokens = "";
+          updateAiMessage(aiContent);
+        }
+        rafId = null;
+      }
+
+      function cancelRaf() {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        if (pendingTokens) {
+          aiContent += pendingTokens;
+          pendingTokens = "";
+        }
+      }
+
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              try {
+                const event = JSON.parse(line.slice(6));
+
+                if (event.type === "token") {
+                  pendingTokens += event.content;
+                  if (!rafId) rafId = requestAnimationFrame(flushTokens);
+                } else if (event.type === "tool_call") {
+                  cancelRaf();
+                  setMessages((prev) => {
+                    const idx = prev.findIndex((m) => m.id === aiMessageId);
+                    if (idx !== -1) {
+                      const ai = prev[idx] as any;
+                      return prev.map((m, i) => i === idx ? {
+                        ...m,
+                        content: aiContent,
+                        tool_calls: [
+                          ...(ai.tool_calls || []),
+                          {
+                            name: event.tool,
+                            args: event.args,
+                            id: crypto.randomUUID(),
+                          },
+                        ],
+                      } : m);
+                    }
+                    return prev;
+                  });
+                } else if (event.type === "tool_output") {
+                  cancelRaf();
+                  setMessages((prev) => {
+                    const idx = prev.findIndex((m) => m.id === aiMessageId);
+                    if (idx !== -1) {
+                      return [
+                        ...prev.slice(0, idx + 1).map((m, i) => i === idx ? { ...m, content: aiContent } : m),
+                        ...prev.slice(idx + 1),
+                        {
+                          id: crypto.randomUUID(),
+                          type: "tool",
+                          name: event.tool,
+                          content: event.result,
+                          tool_call_id: "",
+                        } as Message,
+                      ];
+                    }
+                    return prev;
+                  });
+                } else if (event.type === "usage") {
+                  lastUsageMeta = {
+                    input_tokens: event.input_tokens || 0,
+                    output_tokens: event.output_tokens || 0,
+                    total_tokens: event.total_tokens || 0,
+                    ttft_ms: event.ttft_ms,
+                  };
+                  setMessages((prev) => {
+                    const idx = prev.findIndex((m) => m.id === aiMessageId);
+                    if (idx !== -1) {
+                      return prev.map((m, i) => i === idx ? { ...m, content: aiContent, usage_metadata: lastUsageMeta as any } : m);
+                    }
+                    return prev;
+                  });
+                } else if (event.type === "result") {
+                  cancelRaf();
+                  if (event.answer) aiContent = event.answer;
+                  updateAiMessage(aiContent);
+
+                  if (event.session_id && !threadId) {
+                    setThreadId(event.session_id);
+                    setTimeout(
+                      () =>
+                        getThreads().then(setThreads).catch(console.error),
+                      4000,
+                    );
+                  }
+                  setIsLoading(false);
+                } else if (event.type === "error") {
+                  cancelRaf();
+                  updateAiMessage(aiContent);
+                  setError(event.error || "Unknown error");
+                  setIsLoading(false);
+                }
+              } catch {
+                // Skip malformed JSON
+              }
+            }
+          }
+          // Stream ended — flush remaining tokens
+          cancelRaf();
+          updateAiMessage(aiContent);
+          setIsLoading(false);
+        } catch (e) {
+          cancelRaf();
+          updateAiMessage(aiContent);
+          if ((e as Error).name !== "AbortError") {
+            setError(e);
+          }
+          setIsLoading(false);
+        }
+      })();
+    },
+    [threadId, setThreadId, getThreads, setThreads],
+  );
+
+  const stop = useCallback(() => {
+    if (abortRef.current) {
+      abortRef.current();
+      abortRef.current = null;
+    }
+    setIsLoading(false);
+  }, []);
+
+  const value: StreamContextType = useMemo(
+    () => ({
+      messages,
+      isLoading,
+      error,
+      threadId,
+      values: {},
+      submit,
+      stop,
+      interrupt: null,
+      getMessagesMetadata: () => ({
+        branch: undefined,
+        branchOptions: undefined,
+        firstSeenState: null,
+      }),
+      setBranch: () => {},
+    }),
+    [messages, isLoading, error, threadId, submit, stop],
+  );
 
   return (
-    <StreamContext.Provider value={streamValue}>
-      {children}
-    </StreamContext.Provider>
+    <StreamContext.Provider value={value}>{children}</StreamContext.Provider>
   );
-};
-
-// Default values for the form
-const DEFAULT_API_URL = "http://localhost:2024";
-const DEFAULT_ASSISTANT_ID = "agent";
-const AGENT_BUILDER_AUTH_SCHEME = "langsmith-api-key";
+}
 
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   children,
 }) => {
-  // Get environment variables
   const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
-  const envAssistantId: string | undefined =
-    process.env.NEXT_PUBLIC_ASSISTANT_ID;
-  const envAuthScheme: string | undefined = process.env.NEXT_PUBLIC_AUTH_SCHEME;
 
-  // Use URL params with env var fallbacks
   const [apiUrl, setApiUrl] = useQueryState("apiUrl", {
     defaultValue: envApiUrl || "",
   });
-  const [assistantId, setAssistantId] = useQueryState("assistantId", {
-    defaultValue: envAssistantId || "",
-  });
-  const [authScheme, setAuthScheme] = useQueryState("authScheme", {
-    defaultValue: envAuthScheme || "",
-  });
-  const [isAgentBuilder, setIsAgentBuilder] = useState(
-    () =>
-      (authScheme || envAuthScheme || "").toLowerCase() ===
-      AGENT_BUILDER_AUTH_SCHEME,
-  );
 
-  // For API key, use localStorage with env var fallback
-  const [apiKey, _setApiKey] = useState(() => {
-    const storedKey = getApiKey();
-    return storedKey || "";
-  });
-
-  const setApiKey = (key: string) => {
-    window.localStorage.setItem("lg:chat:apiKey", key);
-    _setApiKey(key);
-  };
-
-  // Determine final values to use, prioritizing URL params then env vars
-  const finalApiUrl = useMemo(() => {
-    let url = apiUrl || envApiUrl || "";
-    if (url.startsWith("/") && typeof window !== "undefined") {
-      url = window.location.origin + url;
+  const resolvedApiUrl = useMemo(() => {
+    if (apiUrl.startsWith("/") && typeof window !== "undefined") {
+      return window.location.origin + apiUrl;
     }
-    return url;
-  }, [apiUrl, envApiUrl]);
-  const finalAssistantId = assistantId || envAssistantId;
-  const finalAuthScheme = authScheme || envAuthScheme || "";
+    return apiUrl;
+  }, [apiUrl]);
 
-  // Show the form if we: don't have an API URL, or don't have an assistant ID
-  if (!finalApiUrl || !finalAssistantId) {
+  if (!resolvedApiUrl) {
     return (
       <div className="flex min-h-screen w-full items-center justify-center p-4">
         <div className="animate-in fade-in-0 zoom-in-95 bg-background flex max-w-3xl flex-col rounded-lg border shadow-lg">
@@ -201,37 +372,23 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
               </h1>
             </div>
             <p className="text-muted-foreground">
-              Welcome to Agent Chat! Before you get started, you need to enter
-              the URL of the deployment and the assistant / graph ID.
+              Welcome! Enter the chat server URL to get started.
             </p>
           </div>
           <form
             onSubmit={(e) => {
               e.preventDefault();
-
               const form = e.target as HTMLFormElement;
               const formData = new FormData(form);
-              const apiUrl = formData.get("apiUrl") as string;
-              const assistantId = formData.get("assistantId") as string;
-              const apiKey = formData.get("apiKey") as string;
-
-              setApiUrl(apiUrl);
-              setApiKey(apiKey);
-              setAssistantId(assistantId);
-              setAuthScheme(isAgentBuilder ? AGENT_BUILDER_AUTH_SCHEME : "");
-
+              setApiUrl(formData.get("apiUrl") as string);
               form.reset();
             }}
             className="bg-muted/50 flex flex-col gap-6 p-6"
           >
             <div className="flex flex-col gap-2">
               <Label htmlFor="apiUrl">
-                Deployment URL<span className="text-rose-500">*</span>
+                Server URL<span className="text-rose-500">*</span>
               </Label>
-              <p className="text-muted-foreground text-sm">
-                This is the URL of your LangGraph deployment. Can be a local, or
-                production deployment.
-              </p>
               <Input
                 id="apiUrl"
                 name="apiUrl"
@@ -240,65 +397,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 required
               />
             </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="assistantId">
-                Assistant / Graph ID<span className="text-rose-500">*</span>
-              </Label>
-              <p className="text-muted-foreground text-sm">
-                This is the ID of the graph (can be the graph name), or
-                assistant to fetch threads from, and invoke when actions are
-                taken.
-              </p>
-              <Input
-                id="assistantId"
-                name="assistantId"
-                className="bg-background"
-                defaultValue={assistantId || DEFAULT_ASSISTANT_ID}
-                required
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="apiKey">LangSmith API Key</Label>
-              <p className="text-muted-foreground text-sm">
-                This is <strong>NOT</strong> required if using a local LangGraph
-                server. This value is stored in your browser's local storage and
-                is only used to authenticate requests sent to your LangGraph
-                server.
-              </p>
-              <PasswordInput
-                id="apiKey"
-                name="apiKey"
-                defaultValue={apiKey ?? ""}
-                className="bg-background"
-                placeholder="lsv2_pt_..."
-              />
-            </div>
-
-            <div className="flex flex-col gap-3">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex flex-col gap-1">
-                  <Label htmlFor="agentBuilderEnabled">
-                    Built with Agent Builder
-                  </Label>
-                  <p className="text-muted-foreground text-sm">
-                    Enable this for Agent Builder deployments.
-                  </p>
-                </div>
-                <Switch
-                  id="agentBuilderEnabled"
-                  checked={isAgentBuilder}
-                  onCheckedChange={setIsAgentBuilder}
-                />
-              </div>
-            </div>
-
             <div className="mt-2 flex justify-end">
-              <Button
-                type="submit"
-                size="lg"
-              >
+              <Button type="submit" size="lg">
                 Continue
                 <ArrowRight className="size-5" />
               </Button>
@@ -310,18 +410,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   }
 
   return (
-    <StreamSession
-      apiKey={apiKey}
-      apiUrl={finalApiUrl}
-      assistantId={finalAssistantId}
-      authScheme={finalAuthScheme || undefined}
-    >
+    <StreamSession apiUrl={resolvedApiUrl}>
       {children}
     </StreamSession>
   );
 };
 
-// Create a custom hook to use the context
 export const useStreamContext = (): StreamContextType => {
   const context = useContext(StreamContext);
   if (context === undefined) {

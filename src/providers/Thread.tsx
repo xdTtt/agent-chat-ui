@@ -3,16 +3,12 @@ import React, {
   useContext,
   ReactNode,
   useCallback,
-  useMemo,
   useState,
   Dispatch,
   SetStateAction,
 } from "react";
-import { validate } from "uuid";
-import { getApiKey } from "@/lib/api-key";
 import { Thread } from "@langchain/langgraph-sdk";
-import { useQueryState } from "nuqs";
-import { createClient } from "./client";
+import { fetchJSON, type SessionInfo } from "./api-client";
 
 interface ThreadContextType {
   getThreads: () => Promise<Thread[]>;
@@ -24,56 +20,29 @@ interface ThreadContextType {
 
 const ThreadContext = createContext<ThreadContextType | undefined>(undefined);
 
-function getThreadSearchMetadata(
-  assistantId: string,
-): { graph_id: string } | { assistant_id: string } {
-  if (validate(assistantId)) {
-    return { assistant_id: assistantId };
-  } else {
-    return { graph_id: assistantId };
-  }
-}
-
 export function ThreadProvider({ children }: { children: ReactNode }) {
-  const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
-  const envAssistantId: string | undefined =
-    process.env.NEXT_PUBLIC_ASSISTANT_ID;
-  const envAuthScheme: string | undefined = process.env.NEXT_PUBLIC_AUTH_SCHEME;
-
-  const [rawApiUrl] = useQueryState("apiUrl", {
-    defaultValue: envApiUrl || "",
-  });
-  const apiUrl = useMemo(() => {
-    if (rawApiUrl.startsWith("/") && typeof window !== "undefined") {
-      return window.location.origin + rawApiUrl;
-    }
-    return rawApiUrl;
-  }, [rawApiUrl]);
-  const [assistantId] = useQueryState("assistantId");
-  const [authScheme] = useQueryState("authScheme", {
-    defaultValue: envAuthScheme || "",
-  });
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(false);
 
   const getThreads = useCallback(async (): Promise<Thread[]> => {
-    const resolvedAssistantId = assistantId || envAssistantId;
-    if (!apiUrl || !resolvedAssistantId) return [];
-    const client = createClient(
-      apiUrl,
-      getApiKey() ?? undefined,
-      authScheme || undefined,
-    );
-
-    const threads = await client.threads.search({
-      metadata: {
-        ...getThreadSearchMetadata(resolvedAssistantId),
-      },
-      limit: 100,
-    });
-
-    return threads;
-  }, [apiUrl, assistantId, authScheme, envAssistantId]);
+    try {
+      const sessions = await fetchJSON<SessionInfo[]>("/sessions");
+      return sessions.map((s) => ({
+        thread_id: s.session_id,
+        created_at: s.created_at || new Date().toISOString(),
+        updated_at: s.created_at || new Date().toISOString(),
+        metadata: {
+          doc_name: s.doc_name || "",
+          doc_id: s.doc_id || "",
+          title: s.title || "",
+        },
+        values: {},
+      })) as unknown as Thread[];
+    } catch (e) {
+      console.error("Failed to fetch sessions:", e);
+      return [];
+    }
+  }, []);
 
   const value = {
     getThreads,
