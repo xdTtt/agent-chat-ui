@@ -1,106 +1,68 @@
 import { parsePartialJson } from "@langchain/core/output_parsers";
 import { useStreamContext } from "@/providers/Stream";
-import { AIMessage, Checkpoint, Message } from "@langchain/langgraph-sdk";
+import { AIMessage, Message } from "@langchain/langgraph-sdk";
 import { getContentString } from "../utils";
 import { BranchSwitcher, CommandBar } from "./shared";
 import { MarkdownText } from "../markdown-text";
-import { LoadExternalComponent } from "@langchain/langgraph-sdk/react-ui";
 import { cn } from "@/lib/utils";
 import { ToolCalls, ToolResult } from "./tool-calls";
 import { MessageContentComplex } from "@langchain/core/messages";
-import { Fragment } from "react/jsx-runtime";
 import { isAgentInboxInterruptSchema } from "@/lib/agent-inbox-interrupt";
 import { ThreadView } from "../agent-inbox";
 import { useQueryState, parseAsBoolean } from "nuqs";
 import { GenericInterruptView } from "./generic-interrupt";
-import { useArtifact } from "../artifact";
 
-function getTokenMeta(
+export function getTokenMeta(
   message: Message,
 ):
-  | { input_tokens: number; output_tokens: number; total_tokens: number }
+  | { input_tokens: number; output_tokens: number; total_tokens: number; ttft_ms?: number }
   | null {
   if ("usage_metadata" in message && message.usage_metadata) {
-    const um = message.usage_metadata;
-    if (um.input_tokens != null && um.output_tokens != null) {
+    const um = message.usage_metadata as Record<string, unknown>;
+    const input = um.input_tokens as number | undefined;
+    const output = um.output_tokens as number | undefined;
+    if (input != null && output != null) {
       return {
-        input_tokens: um.input_tokens,
-        output_tokens: um.output_tokens,
-        total_tokens: um.total_tokens ?? um.input_tokens + um.output_tokens,
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: (um.total_tokens as number) ?? input + output,
+        ttft_ms: um.ttft_ms as number | undefined,
       };
-    }
-  }
-  // Fallback: response_metadata.token_usage (some providers)
-  if ("response_metadata" in message && message.response_metadata) {
-    const rm = message.response_metadata as Record<string, unknown>;
-    const tu = (rm.token_usage ?? rm.usage) as
-      | Record<string, number>
-      | undefined;
-    if (tu) {
-      const input = tu.prompt_tokens ?? tu.input_tokens ?? 0;
-      const output = tu.completion_tokens ?? tu.output_tokens ?? 0;
-      if (input || output) {
-        return {
-          input_tokens: input,
-          output_tokens: output,
-          total_tokens: tu.total_tokens ?? input + output,
-        };
-      }
     }
   }
   return null;
 }
 
-function TokenUsage({
-  meta,
-  messages,
+function TurnSummary({
+  summary,
 }: {
-  meta: NonNullable<ReturnType<typeof getTokenMeta>>;
-  messages: Message[];
+  summary: {
+    totalInput: number;
+    totalOutput: number;
+    llmCalls: number;
+    ttft_ms: number | null;
+  };
 }) {
-  let totalInput = 0;
-  let totalOutput = 0;
-  for (const m of messages) {
-    const um = getTokenMeta(m);
-    if (um) {
-      totalInput += um.input_tokens;
-      totalOutput += um.output_tokens;
-    }
-  }
-  const format = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : n);
+  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+  const total = summary.totalInput + summary.totalOutput;
+  const fmtLatency = (ms: number) =>
+    ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
   return (
-    <span className="text-xs text-muted-foreground">
-      {format(meta.input_tokens)}↓ {format(meta.output_tokens)}↑{" "}
-      (Σ {format(totalInput + totalOutput)})
-    </span>
-  );
-}
-
-function CustomComponent({
-  message,
-  thread,
-}: {
-  message: Message;
-  thread: ReturnType<typeof useStreamContext>;
-}) {
-  const artifact = useArtifact();
-  const { values } = useStreamContext();
-  const customComponents = values.ui?.filter(
-    (ui) => ui.metadata?.message_id === message.id,
-  );
-
-  if (!customComponents?.length) return null;
-  return (
-    <Fragment key={message.id}>
-      {customComponents.map((customComponent) => (
-        <LoadExternalComponent
-          key={customComponent.id}
-          stream={thread}
-          message={customComponent}
-          meta={{ ui: customComponent, artifact }}
-        />
-      ))}
-    </Fragment>
+    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 font-mono">
+        ↑{fmt(summary.totalInput)} ↓{fmt(summary.totalOutput)} Σ{fmt(total)} tokens
+      </span>
+      {summary.ttft_ms != null && (
+        <span className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 font-mono">
+          TTFT {fmtLatency(summary.ttft_ms)}
+        </span>
+      )}
+      {summary.llmCalls > 1 && (
+        <span className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 font-mono">
+          {summary.llmCalls} LLM calls
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -163,10 +125,17 @@ export function AssistantMessage({
   message,
   isLoading,
   handleRegenerate,
+  turnSummary,
 }: {
   message: Message | undefined;
   isLoading: boolean;
-  handleRegenerate: (parentCheckpoint: Checkpoint | null | undefined) => void;
+  handleRegenerate: (parentCheckpoint: unknown) => void;
+  turnSummary: {
+    totalInput: number;
+    totalOutput: number;
+    llmCalls: number;
+    ttft_ms: number | null;
+  } | null;
 }) {
   const content = message?.content ?? [];
   const contentString = getContentString(content);
@@ -240,12 +209,6 @@ export function AssistantMessage({
               </>
             )}
 
-            {message && (
-              <CustomComponent
-                message={message}
-                thread={thread}
-              />
-            )}
             <Interrupt
               interrupt={threadInterrupt}
               isLastMessage={isLastMessage}
@@ -270,11 +233,8 @@ export function AssistantMessage({
                 handleRegenerate={() => handleRegenerate(parentCheckpoint)}
               />
             </div>
-            {message && getTokenMeta(message) && (
-              <TokenUsage
-                meta={getTokenMeta(message)!}
-                messages={thread.messages}
-              />
+            {message && turnSummary && (
+              <TurnSummary summary={turnSummary} />
             )}
           </>
         )}
