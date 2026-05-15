@@ -65,6 +65,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
   const [error, setError] = useState<unknown>(null);
 
   const abortRef = useRef<(() => void) | null>(null);
+  const skipReloadRef = useRef(false);
 
   useEffect(() => {
     checkServerStatus(apiUrl).then((ok) => {
@@ -87,6 +88,10 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
   useEffect(() => {
     if (!threadId) {
       setMessages([]);
+      return;
+    }
+    if (skipReloadRef.current) {
+      skipReloadRef.current = false;
       return;
     }
     fetchJSON<SessionMessage[]>(`/sessions/${threadId}/messages`)
@@ -157,7 +162,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
       const reader = stream.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const aiMessageId = crypto.randomUUID();
+      const aiMessageId = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
       let aiContent = "";
       let pendingTokens = "";
       let rafId: number | null = null;
@@ -275,6 +280,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
                   updateAiMessage(aiContent);
 
                   if (event.session_id && !threadId) {
+                    skipReloadRef.current = true;
                     setThreadId(event.session_id);
                     setTimeout(
                       () =>
