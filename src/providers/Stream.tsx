@@ -13,6 +13,13 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { LangGraphLogoSVG } from "@/components/icons/langgraph";
 import { Label } from "@/components/ui/label";
+
+function generateId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
 import { ArrowRight } from "lucide-react";
 import { useThreads } from "./Thread";
 import { toast } from "sonner";
@@ -100,11 +107,11 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
           .filter((m) => m.type === "human" || m.type === "ai" || m.type === "tool")
           .map((m): Message => {
             if (m.type === "human") {
-              return { id: crypto.randomUUID(), type: "human", content: m.content } as Message;
+              return { id: generateId(), type: "human", content: m.content } as Message;
             }
             if (m.type === "tool") {
               return {
-                id: crypto.randomUUID(),
+                id: generateId(),
                 type: "tool",
                 content: m.content,
                 name: (m as any).name || "tool",
@@ -112,7 +119,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
               } as Message;
             }
             return {
-              id: crypto.randomUUID(),
+              id: generateId(),
               type: "ai",
               content: m.content,
               ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
@@ -145,7 +152,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
       if (!text.trim()) return;
 
       const humanMsg: Message = {
-        id: lastMessage.id || crypto.randomUUID(),
+        id: lastMessage.id || generateId(),
         type: "human",
         content: lastMessage.content,
       };
@@ -162,7 +169,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
       const reader = stream.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const aiMessageId = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+      const aiMessageId = generateId();
       let aiContent = "";
       let pendingTokens = "";
       let rafId: number | null = null;
@@ -234,7 +241,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
                           {
                             name: event.tool,
                             args: event.args,
-                            id: crypto.randomUUID(),
+                            id: generateId(),
                           },
                         ],
                       } : m);
@@ -250,7 +257,7 @@ function StreamSession({ children, apiUrl }: { children: ReactNode; apiUrl: stri
                         ...prev.slice(0, idx + 1).map((m, i) => i === idx ? { ...m, content: aiContent } : m),
                         ...prev.slice(idx + 1),
                         {
-                          id: crypto.randomUUID(),
+                          id: generateId(),
                           type: "tool",
                           name: event.tool,
                           content: event.result,
